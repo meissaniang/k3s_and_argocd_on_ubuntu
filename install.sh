@@ -11,7 +11,7 @@ set -euo pipefail
 #      ──► ingress-nginx (hostNetwork) ──► routing par sous-domaine
 #
 #  Usage :
-#    curl -fsSL https://raw.githubusercontent.com/YOUR_USER/k3s/main/install.sh \
+#    curl -fsSL https://raw.githubusercontent.com/meissaniang/k3s_and_argocd_on_ubuntu/main/install.sh \
 #      | bash -s -- --domain argocd.mondomaine.com
 # ─────────────────────────────────────────────────────────────────────────────
 
