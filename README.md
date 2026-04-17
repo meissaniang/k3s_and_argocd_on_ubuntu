@@ -8,7 +8,7 @@ SSL entièrement géré par Cloudflare. Le VPS ne fait que du HTTP.
 
 ```
 User ──HTTPS──► Cloudflare (SSL) ──HTTP──► VPS :80
-                                            └── ingress-nginx
+                                            └── ingress-nginx (hostNetwork)
                                                   ├── argocd.mondomaine.com → ArgoCD
                                                   ├── app1.mondomaine.com   → App 1
                                                   └── app2.mondomaine.com   → App 2
@@ -16,11 +16,19 @@ User ──HTTPS──► Cloudflare (SSL) ──HTTP──► VPS :80
 
 ---
 
+## Prérequis VPS
+
+- Ubuntu 22.04 / 24.04
+- 2 vCPU / 2 Go RAM minimum
+- Ports **80** et **6443** ouverts dans le pare-feu
+
+---
+
 ## Avant de lancer le script
 
 ### Étape 1 — Ajouter le sous-domaine sur Cloudflare (ou ton hébergeur DNS)
 
-Va sur **Cloudflare → ton domaine → DNS → Add record** et crée l'enregistrement suivant :
+Va sur **Cloudflare → ton domaine → DNS → Add record** :
 
 | Type | Nom | Contenu | Proxy |
 |------|-----|---------|-------|
@@ -29,6 +37,8 @@ Va sur **Cloudflare → ton domaine → DNS → Add record** et crée l'enregist
 > Si tu n'utilises pas Cloudflare, fais la même chose dans l'interface DNS de ton hébergeur (OVH, Gandi, Namecheap…).
 
 ⚠️ **Ce record DNS doit exister avant de lancer le script**, sinon ArgoCD sera installé mais inaccessible depuis l'URL.
+
+> **Réglage Cloudflare SSL** : dans SSL/TLS → Overview, choisis **Flexible** pour que Cloudflare forward le trafic en HTTP vers le VPS.
 
 ### Étape 2 — Se connecter en root sur le VPS
 
@@ -43,16 +53,30 @@ sudo -i
 
 ## Installation
 
-Une fois le DNS créé et la session root ouverte, lance :
+Une fois le DNS créé et la session root ouverte :
+
+### Minimal (mot de passe admin auto-généré)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/meissaniang/k3s_and_argocd_on_ubuntu/main/install.sh \
   | bash -s -- --domain argocd.mondomaine.com
 ```
 
-Le script affiche à la fin l'URL, le login `admin` et le mot de passe initial.
+### Avec création d'un utilisateur personnalisé (recommandé)
 
-### Options
+```bash
+curl -fsSL https://raw.githubusercontent.com/meissaniang/k3s_and_argocd_on_ubuntu/main/install.sh \
+  | bash -s -- \
+      --domain          argocd.mondomaine.com \
+      --argocd-user     tonuser \
+      --argocd-password TonMotDePasse123
+```
+
+Le compte `admin` par défaut est conservé. Un second compte est créé avec les **mêmes droits admin** et le mot de passe que tu as choisi. Les deux sont affichés à la fin.
+
+---
+
+## Options
 
 | Option | Obligatoire | Description |
 |--------|-------------|-------------|
@@ -63,25 +87,18 @@ Le script affiche à la fin l'URL, le login `admin` et le mot de passe initial.
 | `--k3s-version` | ❌ | Version k3s fixée (ex: `v1.29.3+k3s1`) |
 | `--skip-k3s` | ❌ | Saute k3s si déjà installé |
 
-> `--argocd-user` et `--argocd-password` vont toujours ensemble.
-> Le compte `admin` par défaut d'ArgoCD est conservé — un second compte est créé avec les mêmes droits.
-
-Exemple avec création d'un utilisateur personnalisé :
-```bash
-curl -fsSL https://raw.githubusercontent.com/meissaniang/k3s_and_argocd_on_ubuntu/main/install.sh \
-  | bash -s -- \
-      --domain argocd.mondomaine.com \
-      --argocd-user  meissa \
-      --argocd-password MonMotDePasse123
-```
+> `--argocd-user` et `--argocd-password` sont toujours utilisés ensemble.
 
 ---
 
-## Prérequis VPS
+## Ce qui est installé
 
-- Ubuntu 22.04 / 24.04
-- Ports **80** et **6443** ouverts dans le pare-feu
-- 2 vCPU / 2 Go RAM minimum
+| Composant | Rôle |
+|-----------|------|
+| **k3s** | Kubernetes léger (traefik + servicelb désactivés) |
+| **Helm 3** | Gestionnaire de packages k8s |
+| **ingress-nginx** | DaemonSet hostNetwork — bind direct :80, routing par sous-domaine |
+| **ArgoCD** | GitOps CD |
 
 ---
 
@@ -116,11 +133,11 @@ spec:
                   number: 80
 ```
 
-> Voir aussi [`examples/app-ingress.yaml`](examples/app-ingress.yaml) comme base.
+> Voir [`examples/app-ingress.yaml`](examples/app-ingress.yaml) comme base.
 
 ### 3. ArgoCD sync → live
 
-ingress-nginx détecte le nouvel Ingress instantanément. Pas d'autre config nécessaire.
+ingress-nginx détecte le nouvel Ingress instantanément. Pas d'autre configuration nécessaire.
 
 ---
 
@@ -139,4 +156,20 @@ kubectl get nodes
 
 ```bash
 /usr/local/bin/k3s-uninstall.sh
+```
+
+---
+
+## Structure du repo
+
+```
+.
+├── install.sh               ← bootstrap (curl | bash)
+├── README.md
+├── .gitignore
+└── examples/
+    ├── app-ingress.yaml     ← template Ingress à copier par app
+    ├── app-of-apps.yaml     ← pattern ArgoCD app-of-apps
+    ├── sample-app.yaml      ← exemple Application ArgoCD
+    └── values-argocd.yaml   ← valeurs Helm ArgoCD avancées
 ```
