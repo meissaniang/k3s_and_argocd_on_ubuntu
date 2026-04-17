@@ -27,6 +27,7 @@ trap 'die "Échec ligne $LINENO — commande : $BASH_COMMAND"' ERR
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 DOMAIN=""
+ARGOCD_PASSWORD=""
 ARGOCD_NAMESPACE="argocd"
 INGRESS_NAMESPACE="ingress-nginx"
 K3S_VERSION=""
@@ -36,10 +37,11 @@ SKIP_K3S=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain)            DOMAIN="$2";            shift 2 ;;
+    --argocd-password)   ARGOCD_PASSWORD="$2";   shift 2 ;;
     --argocd-namespace)  ARGOCD_NAMESPACE="$2";  shift 2 ;;
     --k3s-version)       K3S_VERSION="$2";       shift 2 ;;
     --skip-k3s)          SKIP_K3S=true;          shift   ;;
-    *) die "Option inconnue : $1\nUsage : --domain argocd.mondomaine.com [--k3s-version vX.Y.Z+k3s1] [--skip-k3s]" ;;
+    *) die "Option inconnue : $1\nUsage : --domain argocd.mondomaine.com [--argocd-password MOT_DE_PASSE] [--k3s-version vX.Y.Z+k3s1] [--skip-k3s]" ;;
   esac
 done
 
@@ -87,7 +89,7 @@ install_deps() {
   step "Dépendances"
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    curl git jq iproute2 ca-certificates
+    curl git jq iproute2 ca-certificates apache2-utils
   success "OK"
 }
 
@@ -167,6 +169,17 @@ install_argocd() {
   helm repo add argo https://argoproj.github.io/argo-helm --force-update >/dev/null
   helm repo update >/dev/null
 
+  local extra_args=""
+  if [[ -n "$ARGOCD_PASSWORD" ]]; then
+    info "Hashage du mot de passe ArgoCD..."
+    local bcrypt_hash
+    bcrypt_hash=$(htpasswd -nbBC 10 "" "$ARGOCD_PASSWORD" | tr -d ':\n' | sed 's/$2y/$2a/')
+    local mtime
+    mtime=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    extra_args="--set configs.secret.argocdServerAdminPassword=${bcrypt_hash} \
+                --set configs.secret.argocdServerAdminPasswordMtime=${mtime}"
+  fi
+
   helm upgrade --install argocd argo/argo-cd \
     --namespace "$ARGOCD_NAMESPACE" \
     --create-namespace \
@@ -175,6 +188,7 @@ install_argocd() {
     --set server.ingress.enabled=true \
     --set server.ingress.ingressClassName=nginx \
     --set "server.ingress.hosts[0]=${DOMAIN}" \
+    $extra_args \
     --wait --timeout 10m
 
   success "ArgoCD installé"
@@ -182,18 +196,22 @@ install_argocd() {
 
 # ── Résumé ────────────────────────────────────────────────────────────────────
 print_summary() {
-  step "Récupération mot de passe ArgoCD"
+  local pass=""
 
-  local i=0
-  until kubectl -n "$ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret &>/dev/null; do
-    sleep 3
-    i=$((i + 1))
-    [[ $i -gt 20 ]] && die "Secret argocd-initial-admin-secret introuvable"
-  done
-
-  local pass
-  pass=$(kubectl -n "$ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret \
-    -o jsonpath="{.data.password}" | base64 -d)
+  if [[ -n "$ARGOCD_PASSWORD" ]]; then
+    # Mot de passe défini par l'utilisateur — pas de secret auto-généré
+    pass="$ARGOCD_PASSWORD"
+  else
+    step "Récupération mot de passe ArgoCD auto-généré"
+    local i=0
+    until kubectl -n "$ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret &>/dev/null; do
+      sleep 3
+      i=$((i + 1))
+      [[ $i -gt 20 ]] && die "Secret argocd-initial-admin-secret introuvable"
+    done
+    pass=$(kubectl -n "$ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret \
+      -o jsonpath="{.data.password}" | base64 -d)
+  fi
 
   echo ""
   echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
@@ -213,7 +231,9 @@ print_summary() {
   echo -e "  2. Helm chart : Ingress avec host: app.mondomaine.com  (voir examples/)"
   echo -e "  3. ArgoCD sync → routage actif instantanément"
   echo ""
-  echo -e "${RED}⚠  Change le mot de passe ArgoCD après ta première connexion !${NC}"
+  if [[ -z "$ARGOCD_PASSWORD" ]]; then
+    echo -e "${RED}⚠  Change le mot de passe ArgoCD après ta première connexion !${NC}"
+  fi
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -223,8 +243,14 @@ main() {
   echo -e "${BOLD}${CYAN}║   k3s + ArgoCD Bootstrap — bare metal + Cloudflare proxy ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
   echo ""
-  info "Domaine ArgoCD : ${DOMAIN}"
-  info "SSL            : géré par Cloudflare (HTTP uniquement côté VPS)"
+  info "Domaine ArgoCD   : ${DOMAIN}"
+  info "Login ArgoCD     : admin"
+  if [[ -n "$ARGOCD_PASSWORD" ]]; then
+    info "Password ArgoCD  : (personnalisé)"
+  else
+    info "Password ArgoCD  : (auto-généré, affiché à la fin)"
+  fi
+  info "SSL              : géré par Cloudflare (HTTP uniquement côté VPS)"
 
   check_root
   check_os

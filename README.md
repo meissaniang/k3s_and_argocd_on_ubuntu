@@ -57,9 +57,18 @@ Le script affiche à la fin l'URL, le login `admin` et le mot de passe initial.
 | Option | Obligatoire | Description |
 |--------|-------------|-------------|
 | `--domain` | ✅ | FQDN ArgoCD (ex: `argocd.mondomaine.com`) |
+| `--argocd-password` | ❌ | Mot de passe admin ArgoCD (auto-généré si absent) |
 | `--argocd-namespace` | ❌ | Namespace k8s (défaut: `argocd`) |
 | `--k3s-version` | ❌ | Version k3s fixée (ex: `v1.29.3+k3s1`) |
 | `--skip-k3s` | ❌ | Saute k3s si déjà installé |
+
+> Le login est toujours **`admin`** — c'est imposé par ArgoCD.
+
+Exemple avec mot de passe personnalisé :
+```bash
+curl -fsSL https://raw.githubusercontent.com/meissaniang/k3s_and_argocd_on_ubuntu/main/install.sh \
+  | bash -s -- --domain argocd.mondomaine.com --argocd-password MonMotDePasse123
+```
 
 ---
 
