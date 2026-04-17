@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  k3s + ArgoCD Bootstrap — VPS bare metal + Cloudflare proxy
@@ -22,6 +22,8 @@ success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 step()    { echo -e "\n${BOLD}${CYAN}▶ $*${NC}"; }
 die()     { echo -e "\n${RED}[ERREUR]${NC} $*" >&2; exit 1; }
+
+trap 'die "Échec ligne $LINENO — commande : $BASH_COMMAND"' ERR
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 DOMAIN=""
@@ -49,30 +51,35 @@ check_root() {
 }
 
 check_os() {
-  [[ -f /etc/os-release ]] && . /etc/os-release
-  case "${ID:-}" in
-    ubuntu|debian) : ;;
-    *) warn "OS non testé : ${PRETTY_NAME:-unknown}" ;;
-  esac
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    case "${ID:-}" in
+      ubuntu|debian) : ;;
+      *) warn "OS non testé : ${PRETTY_NAME:-unknown}" ;;
+    esac
+  fi
 }
 
 check_ports() {
   for port in 80 6443; do
-    ss -tlnp 2>/dev/null | grep -q ":${port} " && warn "Port ${port} déjà utilisé"
+    if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+      warn "Port ${port} déjà utilisé"
+    fi
   done
 }
 
 get_public_ip() {
-  PUBLIC_IP=$(
-    curl -sf --max-time 5 https://ifconfig.me ||
-    curl -sf --max-time 5 https://api.ipify.org ||
-    curl -sf --max-time 5 https://icanhazip.com ||
-    ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' ||
-    echo ""
-  )
-  [[ -z "$PUBLIC_IP" ]] \
-    && warn "IP publique non détectée" \
-    || info "IP publique : ${PUBLIC_IP}"
+  PUBLIC_IP=""
+  PUBLIC_IP=$(curl -sf --max-time 5 https://ifconfig.me)     || \
+  PUBLIC_IP=$(curl -sf --max-time 5 https://api.ipify.org)   || \
+  PUBLIC_IP=$(curl -sf --max-time 5 https://icanhazip.com)   || \
+  PUBLIC_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}') || true
+
+  if [[ -n "$PUBLIC_IP" ]]; then
+    info "IP publique : ${PUBLIC_IP}"
+  else
+    warn "IP publique non détectée"
+  fi
 }
 
 # ── Dépendances ───────────────────────────────────────────────────────────────
@@ -96,9 +103,15 @@ install_k3s() {
   fi
 
   info "Installation k3s ${K3S_VERSION:-latest}..."
-  local env_vars="INSTALL_K3S_EXEC='--disable=traefik --disable=servicelb'"
-  [[ -n "$K3S_VERSION" ]] && env_vars="INSTALL_K3S_VERSION=${K3S_VERSION} ${env_vars}"
-  eval "${env_vars} bash <(curl -sfL https://get.k3s.io)"
+
+  if [[ -n "$K3S_VERSION" ]]; then
+    INSTALL_K3S_VERSION="$K3S_VERSION" \
+    INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb" \
+      bash <(curl -sfL https://get.k3s.io)
+  else
+    INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb" \
+      bash <(curl -sfL https://get.k3s.io)
+  fi
 
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
   echo 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml' > /etc/profile.d/k3s-env.sh
@@ -106,7 +119,8 @@ install_k3s() {
   info "Attente nœud Ready..."
   local i=0
   until kubectl get nodes 2>/dev/null | grep -q " Ready"; do
-    sleep 5; (( i++ ))
+    sleep 5
+    i=$((i + 1))
     [[ $i -gt 36 ]] && die "k3s pas Ready après 3 min"
   done
   success "$(kubectl get nodes --no-headers | awk '{print $1, $2}')"
@@ -115,16 +129,15 @@ install_k3s() {
 # ── Helm ──────────────────────────────────────────────────────────────────────
 install_helm() {
   step "Helm"
-  command -v helm &>/dev/null \
-    && { success "Déjà installé : $(helm version --short)"; return; }
+  if command -v helm &>/dev/null; then
+    success "Déjà installé : $(helm version --short)"
+    return
+  fi
   curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
   success "$(helm version --short)"
 }
 
 # ── ingress-nginx ─────────────────────────────────────────────────────────────
-# hostNetwork=true → bind direct :80 sur le VPS, pas de LoadBalancer
-# DaemonSet        → tourne sur chaque nœud
-# service=ClusterIP → pas de cloud LB nécessaire
 install_nginx_ingress() {
   step "ingress-nginx (hostNetwork — bind direct :80)"
 
@@ -144,7 +157,7 @@ install_nginx_ingress() {
     --set controller.ingressClassResource.name=nginx \
     --wait --timeout 5m
 
-  success "ingress-nginx prêt — port 80 bindé sur le VPS"
+  success "ingress-nginx prêt"
 }
 
 # ── ArgoCD ────────────────────────────────────────────────────────────────────
@@ -173,7 +186,8 @@ print_summary() {
 
   local i=0
   until kubectl -n "$ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret &>/dev/null; do
-    sleep 3; (( i++ ))
+    sleep 3
+    i=$((i + 1))
     [[ $i -gt 20 ]] && die "Secret argocd-initial-admin-secret introuvable"
   done
 
@@ -192,11 +206,11 @@ print_summary() {
   echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
   echo ""
   echo -e "${BOLD}Cloudflare — enregistrement DNS à créer :${NC}"
-  echo -e "  A  |  ${BOLD}${DOMAIN}${NC}  →  ${PUBLIC_IP}  |  Proxy ON ✅"
+  echo -e "  A  |  ${BOLD}${DOMAIN}${NC}  →  ${PUBLIC_IP:-IP_DU_VPS}  |  Proxy ON ✅"
   echo ""
   echo -e "${BOLD}Pour chaque nouvelle app :${NC}"
-  echo -e "  1. Ajoute sur Cloudflare : ${BOLD}app.mondomaine.com${NC} → ${PUBLIC_IP}  (proxy ON)"
-  echo -e "  2. Dans ton Helm chart, déclare un Ingress (voir examples/app-ingress.yaml)"
+  echo -e "  1. Cloudflare : app.mondomaine.com → ${PUBLIC_IP:-IP_VPS}  (proxy ON)"
+  echo -e "  2. Helm chart : Ingress avec host: app.mondomaine.com  (voir examples/)"
   echo -e "  3. ArgoCD sync → routage actif instantanément"
   echo ""
   echo -e "${RED}⚠  Change le mot de passe ArgoCD après ta première connexion !${NC}"
