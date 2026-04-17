@@ -1,0 +1,6 @@
+.DS_Store
+*.local
+*.env
+kubeconfig
+*.kubeconfig
+secrets/

@@ -1,0 +1,64 @@
+# Valeurs Helm avancées pour ArgoCD
+# Usage: helm upgrade argocd argo/argo-cd -f values-argocd.yaml -n argocd
+#
+# Pour utiliser ces valeurs avec le script install.sh, fork le repo
+# et modifiez directement les paramètres --set dans install.sh
+
+global:
+  domain: argocd.example.com   # remplacé dynamiquement par --domain
+
+configs:
+  params:
+    server.insecure: true       # TLS géré par ingress-nginx + cert-manager
+
+  cm:
+    # Activer le login avec username/password
+    admin.enabled: "true"
+
+    # Repositories privés (à adapter)
+    # repositories: |
+    #   - url: https://github.com/YOUR_ORG/private-repo
+    #     passwordSecret:
+    #       name: github-secret
+    #       key: password
+    #     usernameSecret:
+    #       name: github-secret
+    #       key: username
+
+server:
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    tls:
+      - secretName: argocd-tls
+        hosts:
+          - argocd.example.com
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+repoServer:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+applicationSet:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+notifications:
+  enabled: false  # activer si tu veux les notifs Slack/email

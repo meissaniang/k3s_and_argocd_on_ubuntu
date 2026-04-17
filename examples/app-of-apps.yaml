@@ -1,0 +1,22 @@
+# Pattern "App of Apps" : ArgoCD gère lui-même ses applications
+# Un seul repo Git = source de vérité pour tout le cluster
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root-app
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/YOUR_USER/YOUR_REPO.git
+    targetRevision: HEAD
+    path: apps/                  # ce dossier contient d'autres Application YAML
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
