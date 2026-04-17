@@ -1,95 +1,102 @@
-# k3s + ArgoCD Bootstrap — VPS bare metal
+# k3s + ArgoCD Bootstrap — VPS bare metal + Cloudflare
 
-Installation automatique de **k3s**, **ingress-nginx**, **cert-manager** (Let's Encrypt) et **ArgoCD** sur un VPS Ubuntu — en une seule commande `curl`.
+Installation automatique de **k3s**, **ingress-nginx**, **cert-manager** et **ArgoCD** sur un VPS Ubuntu en une seule commande `curl`.
 
-Pas besoin de cloud LoadBalancer : ingress-nginx tourne en **hostNetwork** et bind directement les ports 80/443 du serveur. Chaque domaine/sous-domaine est routé par le contrôleur Ingress.
+## Comment ça fonctionne
+
+```
+Cloudflare                 VPS Ubuntu                    k3s cluster
+──────────────             ───────────────────           ──────────────────────────────
+*.mondomaine.com  ──DNS──► :80 / :443                    ingress-nginx (hostNetwork)
+                           (bind direct, pas de LB)  ──► lit les Ingress en temps réel
+                                                          ├── argocd.mondomaine.com → ArgoCD
+                                                          ├── app1.mondomaine.com   → App 1
+                                                          └── app2.mondomaine.com   → App 2
+                                                               ↑
+                                                          TLS automatique (cert-manager)
+```
+
+**Pour ajouter une nouvelle app :**
+1. Tu ajoutes le sous-domaine sur Cloudflare → `app.mondomaine.com` pointe vers l'IP du VPS
+2. Ton app déclare un `Ingress` avec `host: app.mondomaine.com`
+3. ingress-nginx le détecte instantanément → routage actif + cert-manager émet le TLS
+
+Tu ne touches plus au cluster pour le routage.
+
+---
 
 ## Prérequis
 
 | Exigence | Détail |
 |----------|--------|
-| OS | Ubuntu 22.04 ou 24.04 |
-| RAM | 2 Go minimum (4 Go recommandé) |
-| CPU | 2 vCPU minimum |
-| Accès | root (`sudo -i`) |
+| OS | Ubuntu 22.04 / 24.04 |
+| RAM | 2 Go min (4 Go recommandé) |
+| CPU | 2 vCPU min |
 | Ports ouverts | **80**, **443**, **6443** |
-| DNS | Le domaine pointe déjà vers l'IP du VPS |
+| DNS | Enregistrement A `*.mondomaine.com → IP du VPS` sur Cloudflare |
+
+---
 
 ## Installation
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USER/k3s/main/install.sh | bash -s -- \
-  --domain argocd.example.com \
-  --email   admin@example.com
-```
+### Option A — Cloudflare nuage gris (DNS only) ✅ le plus simple
 
-Le script affiche à la fin l'URL, le login `admin` et le mot de passe initial.
-
-### Toutes les options
-
-| Option | Obligatoire | Défaut | Description |
-|--------|-------------|--------|-------------|
-| `--domain` | ✅ | — | FQDN ArgoCD (ex: `argocd.monsite.com`) |
-| `--email` | ✅ | — | Email pour les certificats Let's Encrypt |
-| `--argocd-namespace` | ❌ | `argocd` | Namespace Kubernetes d'ArgoCD |
-| `--k3s-version` | ❌ | latest | Version précise (ex: `v1.29.3+k3s1`) |
-| `--skip-k3s` | ❌ | — | Saute k3s si déjà installé |
-| `--skip-cert-manager` | ❌ | — | Saute cert-manager si déjà présent |
-
-### Exemples
-
-Avec version k3s fixée :
 ```bash
 curl -fsSL https://raw.githubusercontent.com/YOUR_USER/k3s/main/install.sh | bash -s -- \
   --domain argocd.mondomaine.com \
-  --email  devops@mondomaine.com \
-  --k3s-version v1.29.3+k3s1
+  --email  admin@mondomaine.com
 ```
 
-Sur un cluster k3s existant :
+> Sur Cloudflare : proxy **désactivé** (nuage gris ☁️) pour `*.mondomaine.com`
+
+### Option B — Cloudflare nuage orange (proxy activé) ✅ Let's Encrypt via DNS-01
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/YOUR_USER/k3s/main/install.sh | bash -s -- \
-  --domain argocd.mondomaine.com \
-  --email  devops@mondomaine.com \
-  --skip-k3s
+  --domain              argocd.mondomaine.com \
+  --email               admin@mondomaine.com \
+  --cloudflare-token    TON_CF_API_TOKEN \
+  --cloudflare-zone-id  TON_CF_ZONE_ID
 ```
 
-## Architecture
+> Le token Cloudflare doit avoir la permission `Zone → DNS → Edit`.
+> Génère-le sur : **Cloudflare Dashboard → My Profile → API Tokens → Create Token**
 
-```
-                        Internet
-                           │
-                    ┌──────▼──────┐
-                    │  VPS Ubuntu  │  ← ports 80/443 directs (pas de LB cloud)
-                    └──────┬──────┘
-                           │
-              ┌────────────▼────────────┐
-              │  ingress-nginx           │  hostNetwork=true
-              │  (DaemonSet)             │  bind 80/443 sur le host
-              └────────────┬────────────┘
-                           │  routing par Host header (domaine)
-          ┌────────────────┼────────────────┐
-          ▼                ▼                ▼
-   argocd.dom.com    app1.dom.com     app2.dom.com
-   (ArgoCD UI)       (ton app 1)      (ton app 2)
-          │
-          ▼
-   cert-manager → Let's Encrypt TLS automatique
-```
+---
+
+## Toutes les options
+
+| Option | Obligatoire | Description |
+|--------|-------------|-------------|
+| `--domain` | ✅ | FQDN ArgoCD (ex: `argocd.mondomaine.com`) |
+| `--email` | ✅ | Email Let's Encrypt |
+| `--cloudflare-token` | ❌ | API token CF pour DNS-01 (proxy orange cloud) |
+| `--cloudflare-zone-id` | ❌ | Zone ID Cloudflare (requis avec `--cloudflare-token`) |
+| `--argocd-namespace` | ❌ | Namespace k8s ArgoCD (défaut: `argocd`) |
+| `--k3s-version` | ❌ | Version k3s fixée (ex: `v1.29.3+k3s1`) |
+| `--skip-k3s` | ❌ | Saute k3s si déjà installé |
+| `--skip-cert-manager` | ❌ | Saute cert-manager si déjà présent |
+
+---
 
 ## Ce qui est installé
 
 | Composant | Rôle |
 |-----------|------|
-| **k3s** | Kubernetes léger (traefik et servicelb désactivés) |
-| **Helm 3** | Gestionnaire de packages Kubernetes |
-| **ingress-nginx** | Reverse proxy + routage par domaine (hostNetwork) |
-| **cert-manager** | Certificats TLS automatiques via Let's Encrypt |
-| **ArgoCD** | GitOps — déploiement continu depuis Git |
+| **k3s** | Kubernetes léger (traefik + servicelb désactivés) |
+| **Helm 3** | Gestionnaire de packages k8s |
+| **ingress-nginx** | DaemonSet hostNetwork — bind direct :80/:443 sur le VPS |
+| **cert-manager** | TLS automatique Let's Encrypt (HTTP-01 ou DNS-01 Cloudflare) |
+| **ArgoCD** | GitOps CD — déploiement continu depuis Git |
 
-## Ajouter une application sur le cluster
+---
 
-Chaque nouvelle app déployée sur ce cluster n'a besoin que d'un **Ingress** :
+## Ajouter une app sur le cluster
+
+### 1. Cloudflare
+Ajoute un enregistrement A : `app.mondomaine.com → IP_DU_VPS`
+
+### 2. Ingress dans ton Helm chart / manifests
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -116,40 +123,44 @@ spec:
   tls:
     - hosts:
         - app.mondomaine.com
-      secretName: mon-app-tls
+      secretName: mon-app-tls   # cert-manager crée ce secret automatiquement
 ```
 
-Le certificat TLS est émis automatiquement par cert-manager. Pas d'autre config nécessaire.
+### 3. ArgoCD sync → c'est live
 
-## Accès kubectl depuis ta machine locale
+ingress-nginx détecte le nouvel Ingress immédiatement. cert-manager émet le certificat TLS en ~30 secondes.
+
+---
+
+## Accès kubectl depuis ta machine
 
 ```bash
-# Copier le kubeconfig
-scp root@<IP_VPS>:/etc/rancher/k3s/k3s.yaml ~/.kube/config-k3s
-
-# Remplacer l'IP locale par l'IP publique du VPS
-sed -i 's|https://127.0.0.1:6443|https://<IP_VPS>:6443|g' ~/.kube/config-k3s
-
+scp root@IP_VPS:/etc/rancher/k3s/k3s.yaml ~/.kube/config-k3s
+sed -i 's|https://127.0.0.1:6443|https://IP_VPS:6443|g' ~/.kube/config-k3s
 export KUBECONFIG=~/.kube/config-k3s
 kubectl get nodes
 ```
 
-## Désinstallation complète
+---
+
+## Désinstallation
 
 ```bash
 /usr/local/bin/k3s-uninstall.sh
 ```
 
+---
+
 ## Structure du repo
 
 ```
 .
-├── install.sh                   ← script bootstrap (curl | bash)
+├── install.sh               ← bootstrap (curl | bash)
 ├── README.md
 ├── .gitignore
 └── examples/
-    ├── app-ingress.yaml         ← template Ingress pour une app
-    ├── app-of-apps.yaml         ← pattern ArgoCD app-of-apps
-    ├── sample-app.yaml          ← exemple Application ArgoCD
-    └── values-argocd.yaml       ← valeurs Helm ArgoCD avancées
+    ├── app-ingress.yaml     ← template Ingress pour une app
+    ├── app-of-apps.yaml     ← pattern ArgoCD app-of-apps
+    ├── sample-app.yaml      ← exemple Application ArgoCD
+    └── values-argocd.yaml   ← valeurs Helm ArgoCD avancées
 ```
