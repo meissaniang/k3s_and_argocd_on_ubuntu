@@ -2,19 +2,20 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  k3s + ArgoCD Bootstrap — VPS bare metal
+#  k3s + ArgoCD Bootstrap — VPS bare metal + Cloudflare (proxy toujours ON)
 #
-#  Flux : Cloudflare DNS ──► VPS :80/:443 (ingress-nginx hostNetwork)
-#           ──► routing automatique par sous-domaine (Ingress k8s)
-#           ──► TLS automatique (cert-manager + Let's Encrypt)
+#  Flux :
+#    Cloudflare (proxy ON) ──► VPS :443 (ingress-nginx hostNetwork)
+#      ──► routing par sous-domaine (Ingress k8s)
+#      ──► TLS Let's Encrypt via DNS-01 Cloudflare API
 #
-#  Usage minimal :
+#  Usage :
 #    curl -fsSL https://raw.githubusercontent.com/YOUR_USER/k3s/main/install.sh \
-#      | bash -s -- --domain argocd.example.com --email admin@example.com
-#
-#  Avec proxy Cloudflare (nuage orange) :
-#    ... | bash -s -- --domain argocd.example.com --email admin@example.com \
-#            --cloudflare-token TON_CF_API_TOKEN --cloudflare-zone-id TON_ZONE_ID
+#      | bash -s -- \
+#          --domain             argocd.mondomaine.com \
+#          --email              admin@mondomaine.com  \
+#          --cloudflare-token   CF_API_TOKEN          \
+#          --cloudflare-zone-id CF_ZONE_ID
 # ─────────────────────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -28,45 +29,36 @@ die()     { echo -e "\n${RED}[ERREUR]${NC} $*" >&2; exit 1; }
 # ── Defaults ──────────────────────────────────────────────────────────────────
 DOMAIN=""
 EMAIL=""
+CF_API_TOKEN=""
+CF_ZONE_ID=""
 ARGOCD_NAMESPACE="argocd"
 CERTMANAGER_NAMESPACE="cert-manager"
 INGRESS_NAMESPACE="ingress-nginx"
 K3S_VERSION=""
 SKIP_K3S=false
 SKIP_CERT_MANAGER=false
-# Cloudflare DNS-01 (pour proxy orange cloud)
-CF_API_TOKEN=""
-CF_ZONE_ID=""
 
 # ── Arguments ─────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain)              DOMAIN="$2";            shift 2 ;;
     --email)               EMAIL="$2";             shift 2 ;;
+    --cloudflare-token)    CF_API_TOKEN="$2";      shift 2 ;;
+    --cloudflare-zone-id)  CF_ZONE_ID="$2";        shift 2 ;;
     --argocd-namespace)    ARGOCD_NAMESPACE="$2";  shift 2 ;;
     --k3s-version)         K3S_VERSION="$2";       shift 2 ;;
     --skip-k3s)            SKIP_K3S=true;          shift   ;;
     --skip-cert-manager)   SKIP_CERT_MANAGER=true; shift   ;;
-    --cloudflare-token)    CF_API_TOKEN="$2";      shift 2 ;;
-    --cloudflare-zone-id)  CF_ZONE_ID="$2";        shift 2 ;;
-    *) die "Option inconnue : $1\nUsage: --domain FQDN --email EMAIL [options]" ;;
+    *) die "Option inconnue : $1" ;;
   esac
 done
 
-[[ -z "$DOMAIN" ]] && die "--domain obligatoire  (ex: argocd.example.com)"
-[[ -z "$EMAIL"  ]] && die "--email obligatoire   (ex: admin@example.com)"
+[[ -z "$DOMAIN"        ]] && die "--domain obligatoire            (ex: argocd.mondomaine.com)"
+[[ -z "$EMAIL"         ]] && die "--email obligatoire             (ex: admin@mondomaine.com)"
+[[ -z "$CF_API_TOKEN"  ]] && die "--cloudflare-token obligatoire  (API token Cloudflare Zone DNS Edit)"
+[[ -z "$CF_ZONE_ID"    ]] && die "--cloudflare-zone-id obligatoire (Zone ID dans le dashboard Cloudflare)"
 
-# Mode de validation TLS
-if [[ -n "$CF_API_TOKEN" ]]; then
-  TLS_MODE="cloudflare-dns01"
-  [[ -z "$CF_ZONE_ID" ]] && die "--cloudflare-zone-id obligatoire avec --cloudflare-token"
-  info "Mode TLS : DNS-01 via Cloudflare API (compatible proxy orange cloud)"
-else
-  TLS_MODE="http01"
-  info "Mode TLS : HTTP-01 standard (Cloudflare en DNS only / nuage gris requis)"
-fi
-
-# Domaine racine (ex: "argocd.example.com" → "example.com")
+# Domaine racine : "argocd.mondomaine.com" → "mondomaine.com"
 ROOT_DOMAIN="${DOMAIN#*.}"
 
 # ── Vérifications ─────────────────────────────────────────────────────────────
@@ -85,7 +77,7 @@ check_os() {
 check_ports() {
   for port in 80 443 6443; do
     ss -tlnp 2>/dev/null | grep -q ":${port} " \
-      && warn "Port ${port} déjà utilisé — risque de conflit"
+      && warn "Port ${port} déjà utilisé"
   done
 }
 
@@ -97,12 +89,14 @@ get_public_ip() {
     ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' ||
     echo ""
   )
-  [[ -z "$PUBLIC_IP" ]] && warn "IP publique non détectée" || info "IP publique : ${PUBLIC_IP}"
+  [[ -z "$PUBLIC_IP" ]] \
+    && warn "IP publique non détectée automatiquement" \
+    || info "IP publique détectée : ${PUBLIC_IP}"
 }
 
 # ── Dépendances ───────────────────────────────────────────────────────────────
 install_deps() {
-  step "Dépendances"
+  step "Dépendances système"
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     curl git openssl jq iproute2 ca-certificates
@@ -122,7 +116,7 @@ install_k3s() {
 
   info "Installation k3s ${K3S_VERSION:-latest}..."
   local env_vars="INSTALL_K3S_EXEC='--disable=traefik --disable=servicelb'"
-  [[ -n "$K3S_VERSION" ]] && env_vars="${env_vars} INSTALL_K3S_VERSION=${K3S_VERSION}"
+  [[ -n "$K3S_VERSION" ]] && env_vars="INSTALL_K3S_VERSION=${K3S_VERSION} ${env_vars}"
   eval "${env_vars} bash <(curl -sfL https://get.k3s.io)"
 
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
@@ -147,10 +141,9 @@ install_helm() {
 }
 
 # ── ingress-nginx ─────────────────────────────────────────────────────────────
-# hostNetwork=true  → bind direct sur les ports 80/443 du VPS
+# hostNetwork=true  → nginx bind directement :80/:443 du VPS, pas besoin de LB
 # DaemonSet         → tourne sur chaque nœud
-# service=ClusterIP → aucun LoadBalancer cloud nécessaire
-# ingressClass=default → récupère automatiquement tout Ingress sans classe explicite
+# service=ClusterIP → aucun cloud LoadBalancer nécessaire
 install_nginx_ingress() {
   step "ingress-nginx (hostNetwork — bind direct :80/:443)"
 
@@ -171,12 +164,12 @@ install_nginx_ingress() {
     --set controller.ingressClassResource.name=nginx \
     --wait --timeout 5m
 
-  success "ingress-nginx prêt — ports 80/443 bindés sur le VPS"
+  success "ingress-nginx prêt"
 }
 
-# ── cert-manager ──────────────────────────────────────────────────────────────
+# ── cert-manager + ClusterIssuer DNS-01 Cloudflare ────────────────────────────
 install_cert_manager() {
-  step "cert-manager"
+  step "cert-manager + Let's Encrypt DNS-01 (Cloudflare)"
   $SKIP_CERT_MANAGER && { warn "--skip-cert-manager ignoré"; return; }
 
   helm repo add jetstack https://charts.jetstack.io --force-update >/dev/null
@@ -188,62 +181,14 @@ install_cert_manager() {
     --set installCRDs=true \
     --wait --timeout 5m
 
-  if [[ "$TLS_MODE" == "cloudflare-dns01" ]]; then
-    _setup_clusterissuer_dns01
-  else
-    _setup_clusterissuer_http01
-  fi
-
-  success "cert-manager prêt"
-}
-
-# HTTP-01 : Cloudflare en DNS only (nuage gris)
-_setup_clusterissuer_http01() {
-  info "ClusterIssuer : Let's Encrypt HTTP-01 (DNS only / nuage gris)"
-  kubectl apply -f - <<EOF
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: letsencrypt-prod
-spec:
-  acme:
-    server: https://acme-v02.api.letsencrypt.org/directory
-    email: ${EMAIL}
-    privateKeySecretRef:
-      name: letsencrypt-prod
-    solvers:
-      - http01:
-          ingress:
-            ingressClassName: nginx
----
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: letsencrypt-staging
-spec:
-  acme:
-    server: https://acme-staging-v02.api.letsencrypt.org/directory
-    email: ${EMAIL}
-    privateKeySecretRef:
-      name: letsencrypt-staging
-    solvers:
-      - http01:
-          ingress:
-            ingressClassName: nginx
-EOF
-}
-
-# DNS-01 via Cloudflare API : compatible proxy orange cloud
-_setup_clusterissuer_dns01() {
-  info "ClusterIssuer : Let's Encrypt DNS-01 via Cloudflare (nuage orange OK)"
-
-  # Stocke le token CF dans un secret Kubernetes
+  # Secret contenant le token Cloudflare
   kubectl create namespace "$CERTMANAGER_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
   kubectl create secret generic cloudflare-api-token \
     --namespace "$CERTMANAGER_NAMESPACE" \
     --from-literal=api-token="${CF_API_TOKEN}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
+  # ClusterIssuer production + staging
   kubectl apply -f - <<EOF
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -285,6 +230,8 @@ spec:
           dnsZones:
             - "${ROOT_DOMAIN}"
 EOF
+
+  success "cert-manager prêt — DNS-01 Cloudflare configuré pour ${ROOT_DOMAIN}"
 }
 
 # ── ArgoCD ────────────────────────────────────────────────────────────────────
@@ -309,7 +256,7 @@ install_argocd() {
     --set "server.ingress.tls[0].hosts[0]=${DOMAIN}" \
     --wait --timeout 10m
 
-  success "ArgoCD installé sur https://${DOMAIN}"
+  success "ArgoCD installé"
 }
 
 # ── Résumé ────────────────────────────────────────────────────────────────────
@@ -330,44 +277,36 @@ print_summary() {
   echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
   echo -e "${GREEN}║            ✅  Installation terminée !                   ║${NC}"
   echo -e "${GREEN}╠══════════════════════════════════════════════════════════╣${NC}"
-  printf  "${GREEN}║${NC}  %-14s ${CYAN}%-40s${NC}${GREEN}║${NC}\n" "URL :"       "https://${DOMAIN}"
-  printf  "${GREEN}║${NC}  %-14s ${CYAN}%-40s${NC}${GREEN}║${NC}\n" "Login :"     "admin"
-  printf  "${GREEN}║${NC}  %-14s ${CYAN}%-40s${NC}${GREEN}║${NC}\n" "Mot de passe:" "${pass}"
-  printf  "${GREEN}║${NC}  %-14s ${CYAN}%-40s${NC}${GREEN}║${NC}\n" "IP serveur :" "${PUBLIC_IP:-inconnue}"
-  printf  "${GREEN}║${NC}  %-14s ${CYAN}%-40s${NC}${GREEN}║${NC}\n" "Mode TLS :"  "${TLS_MODE}"
+  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "URL :"         "https://${DOMAIN}"
+  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "Login :"       "admin"
+  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "Mot de passe:" "${pass}"
+  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "IP serveur :"  "${PUBLIC_IP:-inconnue}"
   echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
-
   echo ""
-  echo -e "${BOLD}Cloudflare — enregistrement DNS à créer :${NC}"
-  if [[ "$TLS_MODE" == "cloudflare-dns01" ]]; then
-    echo -e "  Type A  |  ${BOLD}*.${ROOT_DOMAIN}${NC}  →  ${PUBLIC_IP}   (proxy: ✅ orange cloud OK)"
-    echo -e "  Type A  |  ${BOLD}${ROOT_DOMAIN}${NC}      →  ${PUBLIC_IP}   (proxy: ✅ orange cloud OK)"
-  else
-    echo -e "  Type A  |  ${BOLD}*.${ROOT_DOMAIN}${NC}  →  ${PUBLIC_IP}   (proxy: ⚠️  DNS only / nuage gris)"
-    echo -e "  Type A  |  ${BOLD}${ROOT_DOMAIN}${NC}      →  ${PUBLIC_IP}   (proxy: ⚠️  DNS only / nuage gris)"
-  fi
-
+  echo -e "${BOLD}Cloudflare — enregistrement DNS à créer maintenant :${NC}"
+  echo -e "  Type A  |  ${BOLD}${DOMAIN}${NC}  →  ${PUBLIC_IP}  |  Proxy : ✅ ON (nuage orange)"
   echo ""
-  echo -e "${BOLD}Déployer une nouvelle app :${NC}"
-  echo -e "  1. Ajoute le sous-domaine sur Cloudflare  →  ${PUBLIC_IP}"
-  echo -e "  2. Dans ton Helm chart / manifests, ajoute un Ingress avec :"
-  echo -e "     ${CYAN}host: monapp.${ROOT_DOMAIN}${NC}"
-  echo -e "     ${CYAN}annotation: cert-manager.io/cluster-issuer: letsencrypt-prod${NC}"
-  echo -e "  3. ArgoCD sync → ingress-nginx route instantanément → TLS automatique"
+  echo -e "${BOLD}Pour chaque nouvelle app :${NC}"
+  echo -e "  1. Ajoute sur Cloudflare : ${BOLD}sousdomaine.${ROOT_DOMAIN}${NC} → ${PUBLIC_IP}  (proxy ON)"
+  echo -e "  2. Dans ton Helm chart, déclare un Ingress avec :"
+  echo -e "     ${CYAN}host: sousdomaine.${ROOT_DOMAIN}${NC}"
+  echo -e "     ${CYAN}cert-manager.io/cluster-issuer: letsencrypt-prod${NC}"
+  echo -e "  3. ArgoCD sync → ingress-nginx route → TLS émis automatiquement"
   echo ""
-  echo -e "${RED}⚠  Change le mot de passe après ta première connexion !${NC}"
+  echo -e "${RED}⚠  Change le mot de passe ArgoCD après ta première connexion !${NC}"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
   echo ""
   echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║    k3s + ArgoCD Bootstrap — VPS bare metal + Cloudflare  ║${NC}"
+  echo -e "${BOLD}${CYAN}║   k3s + ArgoCD Bootstrap — bare metal + Cloudflare proxy ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
   echo ""
-  info "Domaine ArgoCD : ${DOMAIN}"
-  info "Email TLS      : ${EMAIL}"
-  info "Mode TLS       : ${TLS_MODE}"
+  info "Domaine ArgoCD   : ${DOMAIN}"
+  info "Domaine racine   : ${ROOT_DOMAIN}"
+  info "Email TLS        : ${EMAIL}"
+  info "TLS              : DNS-01 via Cloudflare API (proxy ON compatible)"
 
   check_root
   check_os
