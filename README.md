@@ -57,17 +57,22 @@ Le script affiche à la fin l'URL, le login `admin` et le mot de passe initial.
 | Option | Obligatoire | Description |
 |--------|-------------|-------------|
 | `--domain` | ✅ | FQDN ArgoCD (ex: `argocd.mondomaine.com`) |
-| `--argocd-password` | ❌ | Mot de passe admin ArgoCD (auto-généré si absent) |
+| `--argocd-user` | ❌ | Nom du nouvel utilisateur (droits admin) |
+| `--argocd-password` | ❌ | Mot de passe du nouvel utilisateur |
 | `--argocd-namespace` | ❌ | Namespace k8s (défaut: `argocd`) |
 | `--k3s-version` | ❌ | Version k3s fixée (ex: `v1.29.3+k3s1`) |
 | `--skip-k3s` | ❌ | Saute k3s si déjà installé |
 
-> Le login est toujours **`admin`** — c'est imposé par ArgoCD.
+> `--argocd-user` et `--argocd-password` vont toujours ensemble.
+> Le compte `admin` par défaut d'ArgoCD est conservé — un second compte est créé avec les mêmes droits.
 
-Exemple avec mot de passe personnalisé :
+Exemple avec création d'un utilisateur personnalisé :
 ```bash
 curl -fsSL https://raw.githubusercontent.com/meissaniang/k3s_and_argocd_on_ubuntu/main/install.sh \
-  | bash -s -- --domain argocd.mondomaine.com --argocd-password MonMotDePasse123
+  | bash -s -- \
+      --domain argocd.mondomaine.com \
+      --argocd-user  meissa \
+      --argocd-password MonMotDePasse123
 ```
 
 ---

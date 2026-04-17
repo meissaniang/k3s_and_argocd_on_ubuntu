@@ -27,6 +27,7 @@ trap 'die "Échec ligne $LINENO — commande : $BASH_COMMAND"' ERR
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 DOMAIN=""
+ARGOCD_USER=""
 ARGOCD_PASSWORD=""
 ARGOCD_NAMESPACE="argocd"
 INGRESS_NAMESPACE="ingress-nginx"
@@ -37,15 +38,24 @@ SKIP_K3S=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain)            DOMAIN="$2";            shift 2 ;;
+    --argocd-user)       ARGOCD_USER="$2";       shift 2 ;;
     --argocd-password)   ARGOCD_PASSWORD="$2";   shift 2 ;;
     --argocd-namespace)  ARGOCD_NAMESPACE="$2";  shift 2 ;;
     --k3s-version)       K3S_VERSION="$2";       shift 2 ;;
     --skip-k3s)          SKIP_K3S=true;          shift   ;;
-    *) die "Option inconnue : $1\nUsage : --domain argocd.mondomaine.com [--argocd-password MOT_DE_PASSE] [--k3s-version vX.Y.Z+k3s1] [--skip-k3s]" ;;
+    *) die "Option inconnue : $1" ;;
   esac
 done
 
 [[ -z "$DOMAIN" ]] && die "--domain obligatoire  (ex: argocd.mondomaine.com)"
+
+# Les deux paramètres utilisateur sont liés
+if [[ -n "$ARGOCD_USER" && -z "$ARGOCD_PASSWORD" ]]; then
+  die "--argocd-password obligatoire quand --argocd-user est défini"
+fi
+if [[ -n "$ARGOCD_PASSWORD" && -z "$ARGOCD_USER" ]]; then
+  die "--argocd-user obligatoire quand --argocd-password est défini"
+fi
 
 # ── Checks ────────────────────────────────────────────────────────────────────
 check_root() {
@@ -169,17 +179,6 @@ install_argocd() {
   helm repo add argo https://argoproj.github.io/argo-helm --force-update >/dev/null
   helm repo update >/dev/null
 
-  local extra_args=""
-  if [[ -n "$ARGOCD_PASSWORD" ]]; then
-    info "Hashage du mot de passe ArgoCD..."
-    local bcrypt_hash
-    bcrypt_hash=$(htpasswd -nbBC 10 "" "$ARGOCD_PASSWORD" | tr -d ':\n' | sed 's/$2y/$2a/')
-    local mtime
-    mtime=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-    extra_args="--set configs.secret.argocdServerAdminPassword=${bcrypt_hash} \
-                --set configs.secret.argocdServerAdminPasswordMtime=${mtime}"
-  fi
-
   helm upgrade --install argocd argo/argo-cd \
     --namespace "$ARGOCD_NAMESPACE" \
     --create-namespace \
@@ -188,39 +187,90 @@ install_argocd() {
     --set server.ingress.enabled=true \
     --set server.ingress.ingressClassName=nginx \
     --set "server.ingress.hosts[0]=${DOMAIN}" \
-    $extra_args \
     --wait --timeout 10m
 
   success "ArgoCD installé"
 }
 
+# ── Création d'un utilisateur ArgoCD supplémentaire ───────────────────────────
+create_argocd_user() {
+  [[ -z "$ARGOCD_USER" ]] && return
+
+  step "Création utilisateur ArgoCD : ${ARGOCD_USER}"
+
+  # 1. Déclarer le compte dans argocd-cm
+  kubectl -n "$ARGOCD_NAMESPACE" patch configmap argocd-cm \
+    --type merge \
+    -p "{\"data\":{\"accounts.${ARGOCD_USER}\":\"apiKey, login\"}}"
+
+  # 2. Accorder les droits admin dans argocd-rbac-cm
+  kubectl -n "$ARGOCD_NAMESPACE" patch configmap argocd-rbac-cm \
+    --type merge \
+    -p "{\"data\":{\"policy.csv\":\"g, ${ARGOCD_USER}, role:admin\n\"}}"
+
+  # 3. Attendre que le serveur ArgoCD recharge la config
+  info "Attente rechargement config ArgoCD..."
+  sleep 10
+
+  # 4. Récupérer le mot de passe auto-généré de admin
+  local admin_pass
+  admin_pass=$(kubectl -n "$ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret \
+    -o jsonpath="{.data.password}" | base64 -d)
+
+  # 5. ClusterIP du service argocd-server (accès interne depuis le VPS)
+  local argocd_ip
+  argocd_ip=$(kubectl -n "$ARGOCD_NAMESPACE" get svc argocd-server \
+    -o jsonpath='{.spec.clusterIP}')
+
+  # 6. Obtenir un token JWT admin
+  local token
+  token=$(curl -sf -X POST "http://${argocd_ip}/api/v1/session" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"${admin_pass}\"}" | jq -r .token)
+
+  [[ -z "$token" || "$token" == "null" ]] && die "Impossible d'obtenir un token ArgoCD"
+
+  # 7. Définir le mot de passe du nouvel utilisateur via l'API
+  local http_code
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X PUT "http://${argocd_ip}/api/v1/account/password" \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "{\"name\":\"${ARGOCD_USER}\",\"newPassword\":\"${ARGOCD_PASSWORD}\",\"currentPassword\":\"${admin_pass}\"}")
+
+  [[ "$http_code" == "200" ]] || die "Échec définition mot de passe (HTTP ${http_code})"
+
+  success "Utilisateur '${ARGOCD_USER}' créé avec droits admin"
+}
+
 # ── Résumé ────────────────────────────────────────────────────────────────────
 print_summary() {
-  local pass=""
+  step "Récupération mot de passe ArgoCD"
 
-  if [[ -n "$ARGOCD_PASSWORD" ]]; then
-    # Mot de passe défini par l'utilisateur — pas de secret auto-généré
-    pass="$ARGOCD_PASSWORD"
-  else
-    step "Récupération mot de passe ArgoCD auto-généré"
-    local i=0
-    until kubectl -n "$ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret &>/dev/null; do
-      sleep 3
-      i=$((i + 1))
-      [[ $i -gt 20 ]] && die "Secret argocd-initial-admin-secret introuvable"
-    done
-    pass=$(kubectl -n "$ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret \
-      -o jsonpath="{.data.password}" | base64 -d)
-  fi
+  local i=0
+  until kubectl -n "$ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret &>/dev/null; do
+    sleep 3
+    i=$((i + 1))
+    [[ $i -gt 20 ]] && die "Secret argocd-initial-admin-secret introuvable"
+  done
+  local admin_pass
+  admin_pass=$(kubectl -n "$ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret \
+    -o jsonpath="{.data.password}" | base64 -d)
 
   echo ""
   echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
   echo -e "${GREEN}║            ✅  Installation terminée !                   ║${NC}"
   echo -e "${GREEN}╠══════════════════════════════════════════════════════════╣${NC}"
-  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "URL :"          "https://${DOMAIN}"
-  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "Login :"        "admin"
-  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "Mot de passe :" "${pass}"
-  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "IP serveur :"   "${PUBLIC_IP:-inconnue}"
+  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "URL :"           "https://${DOMAIN}"
+  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "IP serveur :"    "${PUBLIC_IP:-inconnue}"
+  echo -e "${GREEN}╠══════════════════════════════════════════════════════════╣${NC}"
+  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "Login admin :"   "admin"
+  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "Pass admin :"    "${admin_pass}"
+  if [[ -n "$ARGOCD_USER" ]]; then
+  echo -e "${GREEN}╠══════════════════════════════════════════════════════════╣${NC}"
+  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "Login :"         "${ARGOCD_USER}"
+  printf  "${GREEN}║${NC}  %-16s ${CYAN}%-38s${NC}${GREEN}║${NC}\n" "Mot de passe :"  "${ARGOCD_PASSWORD}"
+  fi
   echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
   echo ""
   echo -e "${BOLD}Cloudflare — enregistrement DNS à créer :${NC}"
@@ -230,10 +280,6 @@ print_summary() {
   echo -e "  1. Cloudflare : app.mondomaine.com → ${PUBLIC_IP:-IP_VPS}  (proxy ON)"
   echo -e "  2. Helm chart : Ingress avec host: app.mondomaine.com  (voir examples/)"
   echo -e "  3. ArgoCD sync → routage actif instantanément"
-  echo ""
-  if [[ -z "$ARGOCD_PASSWORD" ]]; then
-    echo -e "${RED}⚠  Change le mot de passe ArgoCD après ta première connexion !${NC}"
-  fi
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -243,14 +289,11 @@ main() {
   echo -e "${BOLD}${CYAN}║   k3s + ArgoCD Bootstrap — bare metal + Cloudflare proxy ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
   echo ""
-  info "Domaine ArgoCD   : ${DOMAIN}"
-  info "Login ArgoCD     : admin"
-  if [[ -n "$ARGOCD_PASSWORD" ]]; then
-    info "Password ArgoCD  : (personnalisé)"
-  else
-    info "Password ArgoCD  : (auto-généré, affiché à la fin)"
+  info "Domaine ArgoCD : ${DOMAIN}"
+  if [[ -n "$ARGOCD_USER" ]]; then
+    info "Nouvel utilisateur : ${ARGOCD_USER} (droits admin)"
   fi
-  info "SSL              : géré par Cloudflare (HTTP uniquement côté VPS)"
+  info "SSL            : géré par Cloudflare (HTTP uniquement côté VPS)"
 
   check_root
   check_os
@@ -261,6 +304,7 @@ main() {
   install_helm
   install_nginx_ingress
   install_argocd
+  create_argocd_user
   print_summary
 }
 
