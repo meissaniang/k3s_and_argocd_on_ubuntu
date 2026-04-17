@@ -4,3 +4,4 @@
 kubeconfig
 *.kubeconfig
 secrets/
+.idea/
