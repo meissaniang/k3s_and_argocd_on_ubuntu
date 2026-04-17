@@ -1,0 +1,27 @@
+# Template Ingress à copier pour chaque nouvelle app sur le cluster
+# Remplace : MON_NAMESPACE, MON_APP, app.mondomaine.com, MON_SERVICE, PORT
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: MON_APP
+  namespace: MON_NAMESPACE
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: app.mondomaine.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: MON_SERVICE
+                port:
+                  number: PORT
+  tls:
+    - hosts:
+        - app.mondomaine.com
+      secretName: MON_APP-tls
